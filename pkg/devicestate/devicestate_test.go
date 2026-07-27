@@ -18,6 +18,7 @@ package devicestate_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,10 +31,12 @@ import (
 
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
 	ovsdpdkdrav1alpha1 "github.com/amorenoz/dra-driver-ovsdpdk/pkg/api/ovsdpdkdra/v1alpha1"
+	ovsportv1alpha1 "github.com/amorenoz/dra-driver-ovsdpdk/pkg/api/ovsport/v1alpha1"
 	"github.com/amorenoz/dra-driver-ovsdpdk/pkg/cdi"
 	"github.com/amorenoz/dra-driver-ovsdpdk/pkg/consts"
 	"github.com/amorenoz/dra-driver-ovsdpdk/pkg/devicestate"
@@ -49,7 +52,7 @@ var _ = Describe("DeviceState", func() {
 	var ds *devicestate.DeviceState
 
 	BeforeEach(func() {
-		ds = devicestate.New(nil, socketfsmocks.NewMockSocketFS(GinkgoT()))
+		ds = devicestate.New(nil, socketfsmocks.NewMockSocketFS(GinkgoT()), nil)
 	})
 
 	Describe("GetAllocatableDevices", func() {
@@ -251,24 +254,24 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim("uid-4", "pod-uid-4", "claim-4", "vhost0", "br0")
 			claim.Status.Allocation.Devices.Results = nil
 			_, err := ds.PrepareResourceClaim(ctx, claim)
-			Expect(err).To(MatchError(ContainSubstring("expected exactly 1 allocation result")))
+			Expect(err).To(MatchError(ContainSubstring("no allocation results for driver")))
 		})
 
 		It("should fall back to claim.Name when the pod-claim-name annotation is absent", func(ctx SpecContext) {
 			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, &ovsdpdkdrav1alpha1.VhostUserSpec{
 				ContainerRootPath: "/container",
 			})
-			podUID := k8stypes.UID("pod-uid-5")
+			podUID := k8stypes.UID("pod-uid-handwritten")
 
-			expectedHostDir := filepath.Join(consts.HostRootPath, string(podUID)+"_"+"my-hand-written-claim")
+			expectedHostDir := filepath.Join(consts.HostRootPath, string(podUID)+"_"+"my-hand-written-claim"+"_"+"req-0")
 			mockFS.EXPECT().CreateSocketDir(mock.Anything, expectedHostDir, mock.Anything).Return(nil).Once()
 
-			claim := makeClaim("uid-5", podUID, "my-hand-written-claim", "vhost0", "br0")
+			claim := makeClaim("abcdef12-0000-0000-0000-000000000005", podUID, "my-hand-written-claim", "vhost0", "br0")
 			delete(claim.Annotations, resourceapi.PodResourceClaimAnnotation)
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.Mount.HostDir).To(Equal(expectedHostDir))
-			Expect(pd.Mount.ContainerDir).To(Equal("/container/my-hand-written-claim"))
+			Expect(pd[0].Mount.HostDir).To(Equal(expectedHostDir))
+			Expect(pd[0].Mount.ContainerDir).To(Equal("/container/my-hand-written-claim/req-0"))
 		})
 
 		It("should use the pod-local claim name for host and container paths", func(ctx SpecContext) {
@@ -278,14 +281,14 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			podUID := k8stypes.UID("pod-uid-ok")
 			podClaimName := "vhost1"
 
-			expectedHostDir := filepath.Join(consts.HostRootPath, string(podUID)+"_"+podClaimName)
+			expectedHostDir := filepath.Join(consts.HostRootPath, string(podUID)+"_"+podClaimName+"_"+"req-0")
 			mockFS.EXPECT().CreateSocketDir(mock.Anything, expectedHostDir, mock.Anything).Return(nil).Once()
 
 			claim := makeClaim("abcdef12-0000-0000-0000-000000000000", podUID, "my-pod-vhost1-xz123", podClaimName, "br0")
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.Mount.HostDir).To(Equal(expectedHostDir))
-			Expect(pd.Mount.ContainerDir).To(Equal("/container/" + podClaimName))
+			Expect(pd[0].Mount.HostDir).To(Equal(expectedHostDir))
+			Expect(pd[0].Mount.ContainerDir).To(Equal("/container/" + podClaimName + "/req-0"))
 		})
 
 		It("should set Socket.HostPath to vhost.sock inside Mount.HostDir", func(ctx SpecContext) {
@@ -295,8 +298,8 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim("abcdef12-0000-0000-0000-000000000001", "pod-uid-sp", "claim-sp", "vhost-sp", "br0")
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.Socket.HostPath).To(Equal(filepath.Join(pd.Mount.HostDir, "vhost.sock")))
-			Expect(pd.Socket.ContainerPath).To(Equal(filepath.Join(pd.Mount.ContainerDir, "vhost.sock")))
+			Expect(pd[0].Socket.HostPath).To(Equal(filepath.Join(pd[0].Mount.HostDir, "vhost.sock")))
+			Expect(pd[0].Socket.ContainerPath).To(Equal(filepath.Join(pd[0].Mount.ContainerDir, "vhost.sock")))
 		})
 
 		It("should set Mount.ContainerDir from ContainerRootPath and pod-local claim name", func(ctx SpecContext) {
@@ -308,7 +311,7 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim("abcdef12-0000-0000-0000-000000000002", "pod-uid-cm", "claim-cm-xz456", "vhost2", "br0")
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.Mount.ContainerDir).To(Equal("/container/root/vhost2"))
+			Expect(pd[0].Mount.ContainerDir).To(Equal("/container/root/vhost2/req-0"))
 		})
 
 		It("should populate BridgeName from the allocation result device", func(ctx SpecContext) {
@@ -318,7 +321,7 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim("abcdef12-0000-0000-0000-000000000003", "pod-uid-bn", "claim-bn", "vhost-bn", "br-dpdk0")
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.BridgeName).To(Equal("br-dpdk0"))
+			Expect(pd[0].BridgeName).To(Equal("br-dpdk0"))
 		})
 
 		It("should populate Device with the correct CDI device ID", func(ctx SpecContext) {
@@ -329,8 +332,8 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim(claimUID, "pod-uid-dev", "claim-dev", "vhost-dev", "br0")
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.Device.CDIDeviceIDs).To(HaveLen(1))
-			Expect(pd.Device.CDIDeviceIDs[0]).To(Equal(cdi.DeviceID(claimUID, "br0")))
+			Expect(pd[0].Device.CDIDeviceIDs).To(HaveLen(1))
+			Expect(pd[0].Device.CDIDeviceIDs[0]).To(Equal(cdi.DeviceID(claimUID, "br0", "req-0")))
 		})
 
 		It("should write a CDI spec file on success", func(ctx SpecContext) {
@@ -341,8 +344,8 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim(claimUID, "pod-uid-cdi", "claim-cdi", "vhost-cdi", "br0")
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pd.Device.CDIDeviceIDs).To(HaveLen(1))
-			Expect(pd.Device.CDIDeviceIDs[0]).To(ContainSubstring("abcdef12"))
+			Expect(pd[0].Device.CDIDeviceIDs).To(HaveLen(1))
+			Expect(pd[0].Device.CDIDeviceIDs[0]).To(ContainSubstring("abcdef12"))
 		})
 
 		It("should clean up the socket directory when CDI spec creation fails", func(ctx SpecContext) {
@@ -356,6 +359,57 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			claim := makeClaim("abcdef12-0000-0000-0000-000000000006", "pod-uid-cleanup", "claim-cleanup-xz789", "vhost-cleanup", "br0")
 			_, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).To(HaveOccurred())
+		})
+
+		It("should prepare multiple resources for a single claim", func(ctx SpecContext) {
+			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, &ovsdpdkdrav1alpha1.VhostUserSpec{
+				ContainerRootPath: "/container",
+			})
+			claimUID := k8stypes.UID("abcdef12-0000-0000-0000-multi0000001")
+			podUID := k8stypes.UID("pod-uid-multi")
+			mockFS.EXPECT().CreateSocketDir(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(2)
+
+			claim := makeClaim(claimUID, podUID, "claim-multi", "vhost-multi", "br0")
+			// Add a second allocation result to the same claim.
+			claim.Status.Allocation.Devices.Results = append(
+				claim.Status.Allocation.Devices.Results,
+				resourceapi.DeviceRequestAllocationResult{
+					Request: "req-1",
+					Driver:  consts.DriverName,
+					Pool:    "pool-1",
+					Device:  "br1",
+				},
+			)
+
+			pds, err := ds.PrepareResourceClaim(ctx, claim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pds).To(HaveLen(2))
+
+			// Each device should have its own request, bridge, paths, and CDI ID.
+			Expect(pds[0].BridgeName).To(Equal("br0"))
+			Expect(pds[1].BridgeName).To(Equal("br1"))
+
+			Expect(pds[0].Device.Requests).To(Equal([]string{"req-0"}))
+			Expect(pds[1].Device.Requests).To(Equal([]string{"req-1"}))
+
+			Expect(pds[0].Device.CDIDeviceIDs).To(HaveLen(1))
+			Expect(pds[1].Device.CDIDeviceIDs).To(HaveLen(1))
+			Expect(pds[0].Device.CDIDeviceIDs[0]).To(Equal(cdi.DeviceID(claimUID, "br0", "req-0")))
+			Expect(pds[1].Device.CDIDeviceIDs[0]).To(Equal(cdi.DeviceID(claimUID, "br1", "req-1")))
+
+			// Paths must be distinct per request.
+			Expect(pds[0].Mount.HostDir).To(Equal(filepath.Join(consts.HostRootPath, string(podUID)+"_vhost-multi_req-0")))
+			Expect(pds[1].Mount.HostDir).To(Equal(filepath.Join(consts.HostRootPath, string(podUID)+"_vhost-multi_req-1")))
+			Expect(pds[0].Mount.ContainerDir).To(Equal("/container/vhost-multi/req-0"))
+			Expect(pds[1].Mount.ContainerDir).To(Equal("/container/vhost-multi/req-1"))
+
+			// Socket paths derive from mount dirs.
+			Expect(pds[0].Socket.HostPath).To(Equal(filepath.Join(pds[0].Mount.HostDir, "vhost.sock")))
+			Expect(pds[1].Socket.HostPath).To(Equal(filepath.Join(pds[1].Mount.HostDir, "vhost.sock")))
+
+			// Both share the same claim identity.
+			Expect(pds[0].ClaimNamespacedName.UID).To(Equal(claimUID))
+			Expect(pds[1].ClaimNamespacedName.UID).To(Equal(claimUID))
 		})
 
 		It("should forward the current VhostUserConfig permissions to CreateSocketDir", func(ctx SpecContext) {
@@ -421,14 +475,125 @@ var _ = Describe("DeviceState prepare/unprepare", func() {
 			pd, err := ds.PrepareResourceClaim(ctx, claim)
 			Expect(err).NotTo(HaveOccurred())
 
-			meta := pd.Device.Metadata
+			meta := pd[0].Device.Metadata
 			Expect(meta).NotTo(BeNil())
 
 			socketAttr, ok := meta.Attributes["vhost-user-path"]
 			Expect(ok).To(BeTrue())
 			Expect(socketAttr.StringValue).NotTo(BeNil())
-			Expect(*socketAttr.StringValue).To(Equal(pd.Socket.ContainerPath))
+			Expect(*socketAttr.StringValue).To(Equal(pd[0].Socket.ContainerPath))
 			Expect(*socketAttr.StringValue).To(HavePrefix(consts.DefaultContainerRootPath))
+		})
+	})
+})
+
+var _ = Describe("DeviceState port config", func() {
+	makeClaimWithConfig := func(claimUID, podUID k8stypes.UID, claimName, podClaimName, bridgeName string, configs []resourceapi.DeviceAllocationConfiguration) *resourceapi.ResourceClaim {
+		claim := makeClaim(claimUID, podUID, claimName, podClaimName, bridgeName)
+		claim.Status.Allocation.Devices.Config = configs
+		return claim
+	}
+
+	makePortConfigEntry := func(cfg ovsportv1alpha1.OvsPortConfig) resourceapi.DeviceAllocationConfiguration {
+		raw, err := json.Marshal(cfg)
+		Expect(err).NotTo(HaveOccurred())
+		return resourceapi.DeviceAllocationConfiguration{
+			Source: resourceapi.AllocationConfigSourceClaim,
+			DeviceConfiguration: resourceapi.DeviceConfiguration{
+				Opaque: &resourceapi.OpaqueDeviceConfiguration{
+					Driver:     consts.DriverName,
+					Parameters: runtime.RawExtension{Raw: raw},
+				},
+			},
+		}
+	}
+
+	Describe("PrepareResourceClaim with OvsPortConfig", func() {
+		It("should set PortConfig to the default when no opaque config is present", func(ctx SpecContext) {
+			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, nil)
+			mockFS.EXPECT().CreateSocketDir(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+			claim := makeClaim("abcdef12-0000-0000-0000-000000000040", "pod-uid-pc0", "claim-pc0", "vhost-pc0", "br0")
+			pd, err := ds.PrepareResourceClaim(ctx, claim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pd[0].PortConfig).NotTo(BeNil())
+			Expect(*pd[0].PortConfig).To(Equal(*ovsportv1alpha1.DefaultOvsPortConfig()))
+		})
+
+		It("should parse a valid OvsPortConfig and store it in PortConfig", func(ctx SpecContext) {
+			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, nil)
+			mockFS.EXPECT().CreateSocketDir(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+			cfg := ovsportv1alpha1.OvsPortConfig{}
+			cfg.APIVersion = ovsportv1alpha1.APIVersion
+			cfg.Kind = ovsportv1alpha1.KindOvsPortConfig
+
+			claim := makeClaimWithConfig(
+				"abcdef12-0000-0000-0000-000000000041", "pod-uid-pc1",
+				"claim-pc1", "vhost-pc1", "br0",
+				[]resourceapi.DeviceAllocationConfiguration{makePortConfigEntry(cfg)},
+			)
+			pd, err := ds.PrepareResourceClaim(ctx, claim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pd[0].PortConfig).NotTo(BeNil())
+			Expect(pd[0].PortConfig.Kind).To(Equal(ovsportv1alpha1.KindOvsPortConfig))
+			Expect(pd[0].PortConfig.APIVersion).To(Equal(ovsportv1alpha1.APIVersion))
+		})
+
+		It("should return an error when the opaque config has an invalid kind", func(ctx SpecContext) {
+			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, nil)
+			mockFS.EXPECT().CreateSocketDir(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+			cfg := ovsportv1alpha1.OvsPortConfig{}
+			cfg.APIVersion = ovsportv1alpha1.APIVersion
+			cfg.Kind = "WrongKind"
+
+			claim := makeClaimWithConfig(
+				"abcdef12-0000-0000-0000-000000000042", "pod-uid-pc2",
+				"claim-pc2", "vhost-pc2", "br0",
+				[]resourceapi.DeviceAllocationConfiguration{makePortConfigEntry(cfg)},
+			)
+			_, err := ds.PrepareResourceClaim(ctx, claim)
+			Expect(err).To(MatchError(ContainSubstring("unexpected kind")))
+		})
+
+		It("should store the vlan from OvsPortConfig in PortConfig", func(ctx SpecContext) {
+			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, nil)
+			mockFS.EXPECT().CreateSocketDir(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+			cfg := ovsportv1alpha1.OvsPortConfig{}
+			cfg.APIVersion = ovsportv1alpha1.APIVersion
+			cfg.Kind = ovsportv1alpha1.KindOvsPortConfig
+			cfg.Vlan = ptr.To(100)
+
+			claim := makeClaimWithConfig(
+				"abcdef12-0000-0000-0000-000000000043", "pod-uid-pc3",
+				"claim-pc3", "vhost-pc3", "br0",
+				[]resourceapi.DeviceAllocationConfiguration{makePortConfigEntry(cfg)},
+			)
+			pd, err := ds.PrepareResourceClaim(ctx, claim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pd[0].PortConfig).NotTo(BeNil())
+			Expect(pd[0].PortConfig.Vlan).NotTo(BeNil())
+			Expect(*pd[0].PortConfig.Vlan).To(Equal(100))
+		})
+
+		It("should return an error when vlan is out of range", func(ctx SpecContext) {
+			ds, mockFS, _ := newDeviceStateWithMockFS(ctx, nil)
+			mockFS.EXPECT().CreateSocketDir(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+			cfg := ovsportv1alpha1.OvsPortConfig{}
+			cfg.APIVersion = ovsportv1alpha1.APIVersion
+			cfg.Kind = ovsportv1alpha1.KindOvsPortConfig
+			cfg.Vlan = ptr.To(5000)
+
+			claim := makeClaimWithConfig(
+				"abcdef12-0000-0000-0000-000000000044", "pod-uid-pc4",
+				"claim-pc4", "vhost-pc4", "br0",
+				[]resourceapi.DeviceAllocationConfiguration{makePortConfigEntry(cfg)},
+			)
+			_, err := ds.PrepareResourceClaim(ctx, claim)
+			Expect(err).To(MatchError(ContainSubstring("out of range")))
 		})
 	})
 })
@@ -449,7 +614,7 @@ func newDeviceStateWithMockFS(ctx SpecContext, vhostUser *ovsdpdkdrav1alpha1.Vho
 	mockFS := socketfsmocks.NewMockSocketFS(GinkgoT())
 	cdi, err := cdi.New(cdiRoot)
 	Expect(err).NotTo(HaveOccurred())
-	ds := devicestate.New(cdi, mockFS)
+	ds := devicestate.New(cdi, mockFS, nil)
 	Expect(ds.UpdateConfig(ctx, &ovsdpdkdrav1alpha1.OvsDpdkConfigSpec{VhostUser: vhostUser})).NotTo(HaveOccurred())
 	return ds, mockFS, cdiRoot
 }
@@ -473,6 +638,7 @@ func makeClaim(claimUID, podUID k8stypes.UID, claimName, podClaimName, bridgeNam
 					Results: []resourceapi.DeviceRequestAllocationResult{
 						{
 							Request: "req-0",
+							Driver:  consts.DriverName,
 							Pool:    "pool-0",
 							Device:  bridgeName,
 						},
